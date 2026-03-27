@@ -178,7 +178,7 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
-        className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-background/80 backdrop-blur-sm overflow-y-auto"
+        className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh] px-[20px] pb-[20px] bg-background/80 backdrop-blur-sm"
         onClick={onClose}
       >
         <motion.div
@@ -186,7 +186,7 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
           animate={{ opacity: 1, scale: 1, y: 0 }}
           exit={{ opacity: 0, scale: 0.95, y: 20 }}
           onClick={(e) => e.stopPropagation()}
-          className="w-full max-w-md max-h-[90vh] overflow-y-auto bg-card border border-border rounded-2xl shadow-[0_0_50px_-12px_rgba(0,0,0,0.5)]"
+          className="w-full max-w-md max-h-[85vh] overflow-y-auto bg-card border border-border rounded-2xl shadow-[0_0_50px_-12px_rgba(0,0,0,0.5)]"
         >
           {/* Invisible Recaptcha Container — hidden from view */}
           <div id="recaptcha-container" className="hidden"></div>
