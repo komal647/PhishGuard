@@ -81,35 +81,52 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.warn(`[API] whois-json failed for ${domain}:`, err);
     }
 
-    // 3. HTTP WHOIS Fallback (To prevent Vercel port 43 blocking)
-    // Serverless platforms block TCP port 43, so we must use an HTTP API
+    // 3. Keyless Wayback Machine CDX API Fallback (HTTP-native, works on Vercel without API keys or port 43)
+    try {
+      console.log(`[API] Attempting keyless Wayback CDX fallback for ${domain}`);
+      const wRes = await fetch(`https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(domain)}&output=json&limit=1`);
+      if (wRes.ok) {
+        const wData = await wRes.json() as string[][];
+        if (wData && wData.length > 1 && wData[1] && wData[1][1]) {
+          const timestamp = wData[1][1];
+          const year = parseInt(timestamp.substring(0, 4), 10);
+          const month = parseInt(timestamp.substring(4, 6), 10) - 1;
+          const day = parseInt(timestamp.substring(6, 8), 10);
+          const firstSeen = new Date(year, month, day);
+          if (!isNaN(firstSeen.getTime())) {
+            days = Math.floor((Date.now() - firstSeen.getTime()) / (1000 * 60 * 60 * 24));
+            created_date = firstSeen.toISOString().substring(0, 10);
+            registrar = 'Wayback Archive (First Seen)';
+            return res.status(200).json({ days, created_date, registrar });
+          }
+        }
+      }
+    } catch (wErr) {
+      console.warn('[API] Wayback CDX fallback failed:', wErr);
+    }
+
+    // 4. HTTP WHOIS Fallback (If API_NINJAS_KEY configured)
     const API_NINJAS_KEY = process.env.API_NINJAS_KEY || process.env.VITE_API_NINJAS_KEY || '';
-    
     if (API_NINJAS_KEY) {
-      console.log(`[API] Using API Ninjas HTTP WHOIS for ${domain}`);
       try {
         const ninjaRes = await fetch(`https://api.api-ninjas.com/v1/whois?domain=${domain}`, {
           headers: { 'X-Api-Key': API_NINJAS_KEY }
         });
-        
         if (ninjaRes.ok) {
           const data = await ninjaRes.json();
           if (data.creation_date) {
-             // API Ninjas typically returns unix timestamp
              const firstSeen = new Date(data.creation_date * 1000);
              if (!isNaN(firstSeen.getTime())) {
                days = Math.floor((Date.now() - firstSeen.getTime()) / (1000 * 60 * 60 * 24));
                created_date = firstSeen.toISOString().substring(0, 10);
              }
           }
-          registrar = data.registrar || 'Unknown';
+          registrar = data.registrar || 'API Ninjas Verified';
           return res.status(200).json({ days, created_date, registrar });
         }
       } catch (e) {
         console.warn('[API] API Ninjas fallback failed:', e);
       }
-    } else {
-      console.log(`[API] No API_NINJAS_KEY found. Unable to perform HTTP WHOIS fallback for ${domain}.`);
     }
 
     // Return what we have (even if it's 0 days, the frontend will handle the fallback logic properly)
