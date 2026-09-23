@@ -35,6 +35,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   for (const url of urls) {
     const cleanUrl = url.startsWith('http') ? url : `https://${url}`;
 
+    // Extract hostname to check against official brand whitelist (protecting official domains from false positives)
+    let hostname = '';
+    try {
+      hostname = new URL(cleanUrl).hostname.toLowerCase();
+    } catch {
+      hostname = cleanUrl.toLowerCase();
+    }
+    const officialBrandList = [
+      'google.com', 'microsoft.com', 'apple.com', 'amazon.com', 'zoom.us', 'zoom.com',
+      'facebook.com', 'github.com', 'linkedin.com', 'twitter.com', 'x.com', 'paypal.com',
+      'stripe.com', 'docusign.com', 'docusign.net', 'cloudflare.com', 'sbi.co.in',
+      'hdfcbank.com', 'icicibank.com', 'indiapost.gov.in', 'usps.com'
+    ];
+    const isOfficialDomain = officialBrandList.some(d => hostname === d || hostname.endsWith(`.${d}`));
+
     // 1. VirusTotal
     if (VIRUSTOTAL_KEY) {
       try {
@@ -51,10 +66,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               scanned: true, malicious: stats.malicious, suspicious: stats.suspicious,
               verdict: stats.malicious > 0 ? 'malicious' : stats.suspicious > 0 ? 'suspicious' : 'clean',
             };
-            if (stats.malicious > 0) {
+            // Ignore minor false positives (<= 3 vendor flags) on top official brand domains like google.com
+            if (stats.malicious > 0 && !(isOfficialDomain && stats.malicious <= 3)) {
               indicators.push({ name: 'VirusTotal Flag', severity: 'high', description: `Flagged malicious by ${stats.malicious} security vendors on VT` });
               score += 60;
-            } else if (stats.suspicious > 0) {
+            } else if (stats.suspicious > 0 && !(isOfficialDomain && stats.suspicious <= 3)) {
               indicators.push({ name: 'VirusTotal Suspicious', severity: 'medium', description: `Flagged suspicious by ${stats.suspicious} security vendors on VT` });
               score += 30;
             }

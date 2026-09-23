@@ -936,15 +936,31 @@ export async function detectPhishing(content: string, type: 'auto' | 'url' | 'em
     }
   }
 
+  // Extract domains to check if all links are official brand domains
+  const tempDomains = new Set<string>();
+  for (const url of urls) {
+    try {
+      const d = new URL(url.startsWith('http') ? url : `https://${url}`).hostname.toLowerCase();
+      tempDomains.add(d);
+    } catch { /* ignore */ }
+  }
+
+  const allLinksAreOfficial = urls.length > 0 && tempDomains.size > 0 && Array.from(tempDomains).every(d => {
+    return Object.values(OFFICIAL_BRAND_DOMAINS).flat().some(official => d === official || d.endsWith(`.${official}`));
+  });
+
   // Combine with Local Heuristics (still runs client-side — no API keys needed)
   const localResult = await performLocalDetection(content, type);
   
-  // Respect local heuristic legitimate guards (2FA, app integration, or cloud alert) when third-party threat APIs report clean (score === 0)
-  if (localResult.label === 'safe' && localResult.risk_percentage <= 15 && score === 0) {
-    return {
-      ...localResult,
-      threat_audit: threat_audit || localResult.threat_audit,
-    };
+  // Respect local heuristic legitimate guards (2FA, app integration, or cloud alert)
+  // When localResult is safe with risk_percentage <= 15%, enforce safe verdict if third-party score is 0 OR all links in the message are official brand domains (overriding VT false positives on google.com, amazon.com, etc.)
+  if (localResult.label === 'safe' && localResult.risk_percentage <= 15) {
+    if (score === 0 || allLinksAreOfficial) {
+      return {
+        ...localResult,
+        threat_audit: threat_audit || localResult.threat_audit,
+      };
+    }
   }
   
   const mergedIndicators = [...indicators, ...localResult.details.indicators];
