@@ -5,7 +5,7 @@ import { componentTagger } from "lovable-tagger";
 import { VitePWA } from "vite-plugin-pwa";
 import whois from "whois-json";
 
-// Custom Vite plugin to handle WHOIS and RDAP requests securely via the Node backend
+// Custom Vite plugin to handle WHOIS and RDAP requests securely via the Node backend during local 'npm run dev'
 function whoisPlugin(): Plugin {
   return {
     name: 'whois-plugin',
@@ -45,7 +45,6 @@ function whoisPlugin(): Plugin {
                   }
                 }
 
-                // Parse Registrar
                 if (rdapData.entities && Array.isArray(rdapData.entities)) {
                    const regEntity = rdapData.entities.find((e: any) => e.roles && e.roles.includes('registrar'));
                    if (regEntity && regEntity.vcardArray && regEntity.vcardArray[1]) {
@@ -64,21 +63,36 @@ function whoisPlugin(): Plugin {
             }
 
             // 2. Fallback to raw WHOIS port 43 lookup using `whois-json`
-            console.log(`[Vite] Falling back to traditional WHOIS for ${domain}`);
-            const whoisData = await whois(domain) as any;
-            
-            // Normalize keys (registrars use different names for creation date)
-            const createdRaw = whoisData['creationDate'] || whoisData['created'] || whoisData['registeredOn'] || whoisData['domainRegistrationDate'];
-            
-            if (createdRaw) {
-              const firstSeen = new Date(createdRaw);
-              if (!isNaN(firstSeen.getTime())) {
-                 days = Math.floor((Date.now() - firstSeen.getTime()) / (1000 * 60 * 60 * 24));
-                 created_date = firstSeen.toISOString().substring(0, 10);
+            try {
+              console.log(`[Vite] Falling back to traditional WHOIS for ${domain}`);
+              const whoisData = await whois(domain) as any;
+              
+              let creationStr = whoisData['creationDate'] || whoisData['created'] || whoisData['registeredOn'] || whoisData['domainRegistrationDate'] || '';
+              
+              if (!creationStr && whoisData) {
+                for (const key in whoisData) {
+                  if (key.toLowerCase().includes('creat') || key.toLowerCase().includes('regist')) {
+                    const val = String(whoisData[key]);
+                    if (val.match(/\d{4}/)) {
+                      creationStr = val;
+                      break;
+                    }
+                  }
+                }
               }
-            }
 
-            registrar = whoisData['registrar'] || whoisData['sponsoringRegistrar'] || 'Unknown';
+              if (creationStr) {
+                const firstSeen = new Date(creationStr);
+                if (!isNaN(firstSeen.getTime())) {
+                   days = Math.floor((Date.now() - firstSeen.getTime()) / (1000 * 60 * 60 * 24));
+                   created_date = firstSeen.toISOString().substring(0, 10);
+                }
+              }
+
+              registrar = whoisData['registrar'] || whoisData['sponsoringRegistrar'] || 'Unknown';
+            } catch (whoisErr) {
+              console.warn(`[Vite] whois-json failed for ${domain}:`, whoisErr);
+            }
 
             res.end(JSON.stringify({ days, created_date, registrar }));
           } catch (error) {
@@ -93,6 +107,7 @@ function whoisPlugin(): Plugin {
     }
   };
 }
+
 export default defineConfig(({ mode }) => ({
   server: {
     host: "::",

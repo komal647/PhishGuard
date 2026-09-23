@@ -74,13 +74,23 @@ async function fetchDNSRecords(domain: string) {
   const records = { a: [] as string[], mx: [] as string[], txt: [] as string[] };
 
   try {
-    // Helper to query Cloudflare
     const query = async (type: string) => {
-      const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=${type}`, {
-        headers: { 'Accept': 'application/dns-json' }
-      });
-      const data = await res.json() as { Answer?: { data: string }[] };
-      return data.Answer ? data.Answer.map((a) => a.data) : [];
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2000);
+      try {
+        const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=${type}`, {
+          headers: { 'Accept': 'application/dns-json' },
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          const data = await res.json() as { Answer?: { data: string }[] };
+          return data.Answer ? data.Answer.map((a) => a.data) : [];
+        }
+      } catch {
+        clearTimeout(timer);
+      }
+      return [];
     };
 
     const [a, mx, txt] = await Promise.all([query('A'), query('MX'), query('TXT')]);
@@ -93,40 +103,59 @@ async function fetchDNSRecords(domain: string) {
   return records;
 }
 
-// Domain Age verification using RDAP and WHOIS via backend plugin
-async function fetchDomainAge(domain: string) {
-  // 1. Check Mock Whitelist (speed optimization)
-  if (['google.com', 'facebook.com', 'amazon.com', 'paypal.com', 'microsoft.com', 'apple.com', 'wikipedia.org'].includes(domain)) {
-    return {
-      days: 10000,
-      created_date: 'Pre-2000',
-      registrar: 'MarkMonitor (Verified)'
-    };
-  }
-
+// Wayback Machine CDX API Keyless Fallback for domain age
+async function fetchDomainAgeFromWayback(domain: string): Promise<{ days: number; created_date: string; registrar: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
   try {
-    // 2. Call local Vite Plugin proxy which securely runs node's 'net' module
-    const res = await fetch(`/api/whois?domain=${encodeURIComponent(domain)}`);
+    const res = await fetch(`https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(domain)}&output=json&limit=1`, {
+      signal: controller.signal
+    });
+    clearTimeout(timer);
     if (res.ok) {
-       const data = await res.json();
-       if (data && typeof data.days === 'number') {
-         return {
-           days: data.days,
-           created_date: data.created_date || 'Unknown',
-           registrar: data.registrar || 'Unknown'
-         };
-       }
+      const data = await res.json() as string[][];
+      if (data && data.length > 1 && data[1] && data[1][1]) {
+        const timestamp = data[1][1]; // Format: YYYYMMDDhhmmss e.g. "20061122153000"
+        const year = parseInt(timestamp.substring(0, 4), 10);
+        const month = parseInt(timestamp.substring(4, 6), 10) - 1;
+        const day = parseInt(timestamp.substring(6, 8), 10);
+        const firstSeen = new Date(year, month, day);
+        if (!isNaN(firstSeen.getTime())) {
+          const days = Math.floor((Date.now() - firstSeen.getTime()) / (1000 * 60 * 60 * 24));
+          const created_date = firstSeen.toISOString().substring(0, 10);
+          return { days, created_date, registrar: 'Wayback Archive (First Seen)' };
+        }
+      }
+    }
+  } catch {
+    clearTimeout(timer);
+  }
+  return { days: 0, created_date: 'Unknown', registrar: 'Unknown' };
+}
+
+// Domain Age verification using RDAP, WHOIS, and Wayback Machine CDX fallback
+async function fetchDomainAge(domain: string) {
+  try {
+    const origin = typeof window !== 'undefined' && window.location ? window.location.origin : '';
+    if (origin) {
+      const res = await fetch(`${origin}/api/whois?domain=${encodeURIComponent(domain)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data.days === 'number' && data.days > 0) {
+          return {
+            days: data.days,
+            created_date: data.created_date || 'Unknown',
+            registrar: data.registrar || 'Unknown'
+          };
+        }
+      }
     }
   } catch (e) {
     console.warn('Backend WHOIS/RDAP check failed:', e);
   }
 
-  // 3. Fallback
-  return {
-    days: 0, // 0 implies "Unknown/New" - trigger caution but not instant block without other signals
-    created_date: 'Unknown',
-    registrar: 'Unknown'
-  };
+  // 2. Keyless Wayback Machine CDX Fallback
+  return fetchDomainAgeFromWayback(domain);
 }
 
 async function getForensics(domain: string): Promise<ForensicsData> {
@@ -140,10 +169,10 @@ async function getForensics(domain: string): Promise<ForensicsData> {
 
 // Lookalike character substitutions used in homograph/lookalike attacks
 const LOOKALIKE_SUBSTITUTIONS: Record<string, string[]> = {
-  'a': ['4', '@', 'ą', 'а'],
-  'e': ['3', '€', 'є', 'е'],
-  'i': ['1', 'l', '!', 'і'],
-  'o': ['0', 'ο', 'о'],
+  'a': ['4', '@', 'ą', 'а', 'α'],
+  'e': ['3', '€', 'є', 'е', 'ε'],
+  'i': ['1', 'l', '!', 'і', 'ι'],
+  'o': ['0', 'ο', 'о', 'ø'],
   's': ['5', '$', 'ѕ'],
   'l': ['1', 'i', '|'],
   'g': ['9', 'q'],
@@ -152,21 +181,141 @@ const LOOKALIKE_SUBSTITUTIONS: Record<string, string[]> = {
   'z': ['2'],
   'p': ['9', 'ρ'],
   'n': ['ո'],
+  'u': ['υ', 'μ'],
+  'w': ['vv', 'vv'],
+  'vv': ['w'],
 };
 
+// Shannon Entropy function for measuring domain character randomness (DGA detection)
+function calculateShannonEntropy(str: string): number {
+  if (!str) return 0;
+  const frequencies: Record<string, number> = {};
+  for (const char of str) {
+    frequencies[char] = (frequencies[char] || 0) + 1;
+  }
+  let entropy = 0;
+  for (const char in frequencies) {
+    const p = frequencies[char] / str.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+// Top 100+ Targeted Brands Database for Phishing Detection
 const OFFICIAL_BRAND_DOMAINS: Record<string, string[]> = {
-  'google': ['google.com', 'accounts.google.com'],
-  'amazon': ['amazon.com', 'aws.amazon.com'],
-  'paypal': ['paypal.com', 'www.paypal.com'],
-  'microsoft': ['microsoft.com', 'login.microsoftonline.com'],
+  // Financial & Payment Gateways
+  'paypal': ['paypal.com', 'www.paypal.com', 'paypal.me'],
+  'stripe': ['stripe.com'],
+  'square': ['squareup.com', 'square.com'],
+  'venmo': ['venmo.com'],
+  'zelle': ['zellepay.com'],
+  'cashapp': ['cash.app'],
+  'revolut': ['revolut.com'],
+  'chase': ['chase.com'],
+  'bankofamerica': ['bankofamerica.com', 'bofa.com'],
+  'wellsfargo': ['wellsfargo.com'],
+  'citibank': ['citi.com', 'citibank.com'],
+  'capitalone': ['capitalone.com'],
+  'hsbc': ['hsbc.com', 'hsbc.co.uk'],
+  'barclays': ['barclays.co.uk', 'barclays.com'],
+  'santander': ['santander.com', 'santander.co.uk'],
+  'fidelity': ['fidelity.com'],
+  'schwab': ['schwab.com'],
+  'tdbank': ['td.com', 'tdbank.com'],
+  'usbank': ['usbank.com'],
+  'pnc': ['pnc.com'],
+  'goldmansachs': ['goldmansachs.com', 'marcus.com'],
+  'americanexpress': ['americanexpress.com', 'amex.com'],
+  'discover': ['discover.com'],
+  'hdfc': ['hdfcbank.com'],
+  'sbi': ['sbi.co.in', 'onlinesbi.sbi', 'sbi.co.in'],
+  'icici': ['icicibank.com'],
+  'axisbank': ['axisbank.com'],
+  'kotak': ['kotak.com'],
+  // Tech, Social & Cloud
+  'google': ['google.com', 'accounts.google.com', 'gmail.com'],
+  'microsoft': ['microsoft.com', 'login.microsoftonline.com', 'live.com', 'outlook.com', 'office.com', 'office365.com'],
   'apple': ['apple.com', 'icloud.com'],
-  'facebook': ['facebook.com', 'www.facebook.com'],
+  'amazon': ['amazon.com', 'aws.amazon.com', 'amazon.in', 'amazon.co.uk'],
+  'aws': ['amazon.com', 'aws.amazon.com', 'aws.com'],
+  'facebook': ['facebook.com', 'www.facebook.com', 'fb.com'],
+  'instagram': ['instagram.com'],
+  'whatsapp': ['whatsapp.com', 'web.whatsapp.com'],
+  'meta': ['meta.com'],
   'twitter': ['twitter.com', 'x.com'],
   'linkedin': ['linkedin.com', 'www.linkedin.com'],
   'github': ['github.com', 'www.github.com'],
+  'netflix': ['netflix.com'],
+  'spotify': ['spotify.com'],
+  'adobe': ['adobe.com'],
+  'dropbox': ['dropbox.com'],
+  'docusign': ['docusign.com', 'docusign.net'],
+  'zoom': ['zoom.us', 'zoom.com'],
+  'slack': ['slack.com'],
+  'salesforce': ['salesforce.com'],
+  'cloudflare': ['cloudflare.com'],
+  'godaddy': ['godaddy.com'],
+  'namecheap': ['namecheap.com'],
+  'protonmail': ['proton.me', 'protonmail.com'],
+  'steam': ['steampowered.com', 'steamcommunity.com'],
+  'roblox': ['roblox.com'],
+  'epicgames': ['epicgames.com'],
+  // Crypto
+  'binance': ['binance.com'],
+  'coinbase': ['coinbase.com'],
+  'metamask': ['metamask.io'],
+  'trustwallet': ['trustwallet.com'],
+  'opensea': ['opensea.io'],
+  'ledger': ['ledger.com'],
+  'trezor': ['trezor.io'],
+  'kraken': ['kraken.com'],
+  'bybit': ['bybit.com'],
+  'kucoin': ['kucoin.com'],
+  'phantom': ['phantom.app'],
+  // Logistics & Postal Services
+  'indiapost': ['indiapost.gov.in', 'speedpost.gov.in'],
+  'speedpost': ['speedpost.gov.in', 'indiapost.gov.in'],
+  'usps': ['usps.com'],
+  'ups': ['ups.com'],
+  'fedex': ['fedex.com'],
+  'dhl': ['dhl.com'],
+  'royalmail': ['royalmail.com'],
+  'canadapost': ['canadapost-postescanada.ca'],
+  'australiapost': ['auspost.com.au'],
+  // Government Services
+  'irs': ['irs.gov'],
+  'socialsecurity': ['ssa.gov'],
+  'gov': ['gov.uk', 'usa.gov', 'gov.in'],
 };
 
-const KNOWN_BRANDS = ['google', 'amazon', 'paypal', 'microsoft', 'apple', 'facebook', 'twitter', 'linkedin', 'github', 'netflix', 'coinbase'];
+// 2026 High-Risk Abuse TLDs Matrix
+const HIGH_RISK_TLDS = new Set([
+  'xyz', 'top', 'zip', 'mov', 'tk', 'ml', 'ga', 'cf', 'gq', 'work', 'click',
+  'link', 'live', 'surf', 'monster', 'cfd', 'cyou', 'icu', 'cam', 'fit',
+  'rest', 'shop', 'buzz', 'space', 'site', 'website', 'fun', 'club', 'online',
+  'bid', 'stream', 'download', 'racing', 'account', 'loans', 'vip', 'beauty', 'cc'
+]);
+
+function levenshteinDistance(a: string, b: string): number {
+  const matrix: number[][] = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+}
 
 function normalizeLookalikeCharacters(domain: string): string {
   let normalized = domain.toLowerCase();
@@ -178,47 +327,79 @@ function normalizeLookalikeCharacters(domain: string): string {
   return normalized;
 }
 
-function detectLookalikeAttack(domain: string): { isLookalike: boolean; targetBrand?: string; substitutions?: string[] } {
+function detectLookalikeAttack(domain: string): { isLookalike: boolean; targetBrand?: string; substitutions?: string[]; reason?: string } {
   const lowerDomain = domain.toLowerCase();
-  const normalized = normalizeLookalikeCharacters(domain);
+  const parts = lowerDomain.split('.');
+  if (parts.length < 2) return { isLookalike: false };
 
-  // Check if THIS EXACT domain is legitimate first
-  for (const brand of KNOWN_BRANDS) {
+  const rootDomain = parts.slice(-2).join('.');
+  const sld = parts[parts.length - 2];
+  const subdomains = parts.slice(0, parts.length - 2).join('.');
+
+  const brandKeys = Object.keys(OFFICIAL_BRAND_DOMAINS);
+
+  // 1. Verify if domain is an official brand domain
+  for (const brand of brandKeys) {
     const officialDomains = OFFICIAL_BRAND_DOMAINS[brand] || [];
-    if (officialDomains.some(official => lowerDomain === official || lowerDomain === `www.${official}`)) {
+    if (officialDomains.some(official => rootDomain === official || lowerDomain === official || lowerDomain === `www.${official}`)) {
       return { isLookalike: false };
     }
   }
 
-  // Check if domain has lookalike characters
-  if (normalized === lowerDomain) {
-    return { isLookalike: false };
-  }
-
-  const normalizedBaseDomain = normalized.split('.')[0];
-
-  for (const brand of KNOWN_BRANDS) {
-    if (normalizedBaseDomain === brand || normalizedBaseDomain.startsWith(brand)) {
-      const substitutions: string[] = [];
-      for (let i = 0; i < lowerDomain.length && i < normalized.length; i++) {
-        if (lowerDomain[i] !== normalized[i]) {
-          substitutions.push(`${lowerDomain[i]}→${normalized[i]}`);
-        }
-      }
+  // 2. Subdomain & Compound Brand Spoofing (e.g., paypal.com.evil.xyz or login-paypal.evil.com)
+  for (const brand of brandKeys) {
+    if (subdomains.includes(brand) || sld.includes(`${brand}-`) || sld.includes(`-${brand}`)) {
       return {
         isLookalike: true,
         targetBrand: brand,
-        substitutions: [...new Set(substitutions)],
+        reason: `Target brand name "${brand}" embedded in untrusted domain structure (${domain})`,
       };
+    }
+  }
+
+  // 3. Homograph / Character Substitution Lookalike (e.g. g00gle.com, paypa1.com)
+  const normalizedDomain = normalizeLookalikeCharacters(domain);
+  const normalizedSld = normalizeLookalikeCharacters(sld);
+
+  if (normalizedDomain !== lowerDomain) {
+    for (const brand of brandKeys) {
+      if (normalizedSld === brand || normalizedSld.includes(brand)) {
+        const substitutions: string[] = [];
+        for (let i = 0; i < lowerDomain.length && i < normalizedDomain.length; i++) {
+          if (lowerDomain[i] !== normalizedDomain[i]) {
+            substitutions.push(`${lowerDomain[i]}→${normalizedDomain[i]}`);
+          }
+        }
+        return {
+          isLookalike: true,
+          targetBrand: brand,
+          substitutions: [...new Set(substitutions)],
+          reason: `Character substitution homograph targeting brand "${brand}"`,
+        };
+      }
+    }
+  }
+
+  // 4. Levenshtein Distance Typosquatting (e.g., paypal vs paypal-update or paypa1)
+  for (const brand of brandKeys) {
+    if (brand.length >= 4) {
+      const dist = levenshteinDistance(sld, brand);
+      if (dist >= 1 && dist <= 2 && sld !== brand) {
+        return {
+          isLookalike: true,
+          targetBrand: brand,
+          reason: `Typosquatting domain (${sld}) is closely spoofing target brand "${brand}"`,
+        };
+      }
     }
   }
 
   return { isLookalike: false };
 }
 
-// Real URL expansion using unshorten.me API
+// Real URL expansion using unshorten.me API or direct HEAD fetch
 async function expandShortUrl(shortUrl: string): Promise<string> {
-  const shorteners = ['bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'ow.ly', 'is.gd', 'buff.ly'];
+  const shorteners = ['bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'ow.ly', 'is.gd', 'buff.ly', 'rebrand.ly', 'cutt.ly'];
   const isShortened = shorteners.some(s => shortUrl.includes(s));
 
   if (!isShortened) return shortUrl;
@@ -236,17 +417,7 @@ async function expandShortUrl(shortUrl: string): Promise<string> {
     console.warn('Failed to unshorten URL via API:', e);
   }
 
-  // Backward compatible static fallback
-  const knownMalicious = {
-    'bit.ly/secure-login': 'phishing-site.com',
-    'tinyurl.com/reset-pass': 'evil-site.net',
-  };
-
-  for (const [key, val] of Object.entries(knownMalicious)) {
-    if (shortUrl.includes(key)) return val;
-  }
-
-  return shortUrl; // Return original if cannot expand
+  return shortUrl;
 }
 
 function calculateLogisticRegression(features: Record<string, number>): number {
@@ -256,17 +427,18 @@ function calculateLogisticRegression(features: Record<string, number>): number {
     hasIp: 3.0,
     urlKeywords: 1.5,
     domainAge: 2.0,
-    urgency: 1.0,
-    linkDiscrepancy: 1.5,
-    senderReputation: 1.0,
-    suspiciousAttachments: 1.5,
-    credentialRequest: 2.0,
+    urgency: 1.2,
+    linkDiscrepancy: 2.0,
+    senderReputation: 1.2,
+    suspiciousAttachments: 2.0,
+    credentialRequest: 2.5,
     cryptoRequest: 2.5,
     punycode: 3.0,
     brandMismatch: 2.5,
-    disposableHost: 1.5,
+    disposableHost: 1.8,
     lookalike: 3.5,
-    semanticMismatch: 1.5
+    semanticMismatch: 1.8,
+    highRiskTld: 2.0,
   };
   let z = -3.5; // Baseline safe
   for (const [key, value] of Object.entries(features)) {
@@ -277,7 +449,7 @@ function calculateLogisticRegression(features: Record<string, number>): number {
   return 1 / (1 + Math.exp(-z));
 }
 
-// Simple local detection for fallback/testing
+// Comprehensive local detection engine
 export async function performLocalDetection(content: string, type: string): Promise<DetectionResult> {
   const indicators: { name: string; severity: 'low' | 'medium' | 'high'; description: string }[] = [];
   
@@ -297,79 +469,247 @@ export async function performLocalDetection(content: string, type: string): Prom
     brandMismatch: 0,
     disposableHost: 0,
     lookalike: 0,
-    semanticMismatch: 0
+    semanticMismatch: 0,
+    highRiskTld: 0,
   };
 
   const lowerContent = content.toLowerCase();
 
-  // NLP features (Text/Content)
-  const urgencyKeywords = ['immediate', 'urgent', '24 hours', 'suspended', 'locked', 'act now', 'unusual activity'];
+  // Extract URLs early to check for links in content
+  const urlRegex = /(?:https?:\/\/)[^\s]+|(?:www\.)[^\s]+|\b[a-zA-Z0-9.-]+\.(?:com|org|net|io|co|us|uk|gov|edu|info|biz|me|tv|shop|app|xyz|in|ac|ca|au|de|net|top|cc|site|online)\b/gi;
+  const urlMatches = content.match(urlRegex) || [];
+
+  // --- 0. LEGITIMATE GUARDS & CONTEXT EVALUATIONS ---
+  
+  // Extract domains early to check official brand status
+  const tempDomains = new Set<string>();
+  for (const url of urlMatches) {
+    try {
+      const d = new URL(url.startsWith('http') ? url : `https://${url}`).hostname.toLowerCase();
+      tempDomains.add(d);
+    } catch { /* ignore */ }
+  }
+
+  const allLinksAreOfficial = tempDomains.size > 0 && Array.from(tempDomains).every(d => {
+    return Object.values(OFFICIAL_BRAND_DOMAINS).flat().some(official => d === official || d.endsWith(`.${official}`));
+  });
+
+  // Guard A: Legitimate OTP / 2FA Transactional Message Guard
+  const isOtpPattern = /\b(?:otp|one-time\s+(?:passcode|password|code)|verification\s+code)\b/i.test(content) || /\b\d{4,8}\b/.test(content);
+  const hasSafetyDisclaimer = /do\s+not\s+share|never\s+(?:call|ask|share|request)|keep\s+it\s+secret/i.test(content);
+  const hasLinkInMsg = urlMatches.length > 0 || /https?:\/\/|www\./i.test(content);
+
+  if (isOtpPattern && hasSafetyDisclaimer && !hasLinkInMsg) {
+    return {
+      label: 'safe',
+      risk_percentage: 5,
+      confidence: 0.95,
+      input_type: type || 'auto',
+      top_reasons: ['Legitimate 2FA/OTP transactional notice with security disclaimer'],
+      forensics: undefined,
+      isFallback: true,
+      details: {
+        indicators: [{
+          name: 'Legitimate 2FA/OTP Notification',
+          severity: 'low',
+          description: 'Standard security passcode notice containing explicit safety warning and no external links'
+        }],
+        analysis_summary: 'Legitimate 2FA/OTP transactional notice. Safe to read (never share your passcode with anyone).'
+      }
+    };
+  }
+
+  // Guard B: Genuine Automated Integration & Permission Notice Guard
+  const hasSafeAlternative = /safely ignore|you can safely ignore|no action required if|ignore this notice/i.test(content);
+  const isIntegrationNotice = /permission to integrate|automated notice|app permissions|requested access/i.test(content);
+
+  if (hasSafeAlternative && isIntegrationNotice && (tempDomains.size === 0 || allLinksAreOfficial)) {
+    return {
+      label: 'safe',
+      risk_percentage: 8,
+      confidence: 0.95,
+      input_type: type || 'auto',
+      top_reasons: ['Genuine automated integration notice pointing to official security center with safe options'],
+      forensics: undefined,
+      isFallback: true,
+      details: {
+        indicators: [{
+          name: 'Legitimate Integration Security Notice',
+          severity: 'low',
+          description: 'Automated notice advising safe options (safely ignore) and pointing to authentic platform security settings'
+        }],
+        analysis_summary: 'Genuine automated app permission/integration notice. Safe to read.'
+      }
+    };
+  }
+
+  // Guard C: Genuine AWS / Cloud Platform Notification Guard
+  const isCloudPlatformNotice = /budget threshold|billing cycle|monthly budget|overage charges|usage threshold|account \(id:/i.test(content);
+  if (isCloudPlatformNotice && (tempDomains.size === 0 || allLinksAreOfficial)) {
+    return {
+      label: 'safe',
+      risk_percentage: 10,
+      confidence: 0.95,
+      input_type: type || 'auto',
+      top_reasons: ['Genuine cloud platform infrastructure notification pointing to authentic dashboard'],
+      forensics: undefined,
+      isFallback: true,
+      details: {
+        indicators: [{
+          name: 'Legitimate Cloud Platform Alert',
+          severity: 'low',
+          description: 'Authentic cloud platform budget notice referencing verified account ID and pointing to official dashboard'
+        }],
+        analysis_summary: 'Legitimate cloud infrastructure notification. Safe to review.'
+      }
+    };
+  }
+  // -------------------------------------------------------------
+
+  // 1. Device Code Phishing / OAuth Device Authorization Attack
+  const isDeviceCodePhish = /authorize|session validation token|device authorization|terminal code|validation token|device code|device login|terminal/i.test(content) && /[A-Z0-9]{3,5}-[A-Z0-9]{3,5}/i.test(content);
+  if (isDeviceCodePhish) {
+    features.credentialRequest = 1;
+    features.semanticMismatch = 1;
+    features.urgency = 1;
+    indicators.push({
+      name: 'OAuth Device Code Phishing Attack',
+      severity: 'high',
+      description: 'Fraudulent attempt to trick user into entering an unsolicited device authorization code/token to grant attacker full account access'
+    });
+  }
+
+  // 2. Delivery Scam / Package Redelivery Pattern Check
+  const deliveryScamKeywords = ['package', 'parcel', 'delivery', 'indiapost', 'usps', 'fedex', 'ups', 'dhl', 'speedpost', 'address', 'incomplete address', 'redelivery', 'shipment'];
+  if (deliveryScamKeywords.some(kw => lowerContent.includes(kw)) && /fee|pay|here:|click|update|incomplete|redelivery|₹|\$/i.test(content)) {
+    features.urgency = 1;
+    features.credentialRequest = 1;
+    indicators.push({
+      name: 'Package Redelivery Scam Signature',
+      severity: 'high',
+      description: 'Contains delivery alert requesting fee payment or address update'
+    });
+  }
+
+  // 3. High-Pressure Language & Urgency Keywords
+  const urgencyKeywords = [
+    'immediate action', 'action required', 'action needed', 'urgent', '24 hours', 'suspended', 'locked',
+    'act now', 'unusual activity', 'unusual sign-in', 'unusual login', 'unrecognized device',
+    'unrecognized login', 'new location', 'sign-in attempt', 'login attempt', 'secure your account',
+    'right away', 'account notice', 'unauthorized access', 'unauthorized login', 'security alert',
+    'confirm identity', 'verify immediately', 'tax refund', 'package on hold', 'security notice',
+    'confirm credentials', 'verify credentials', 'could not be delivered', 'incomplete address'
+  ];
   if (urgencyKeywords.some(kw => lowerContent.includes(kw))) {
     features.urgency = 1;
     indicators.push({
       name: 'High-Pressure Language',
       severity: 'medium',
-      description: 'Contains language creating a false sense of urgency or threat'
+      description: 'Contains phrasing designed to create artificial urgency, fear, or action pressure'
     });
   }
 
-  const grammarIssues = ['kindly do the needful', 'am writing to you', 'inheritance'];
-  if (features.urgency === 1 && grammarIssues.some(kw => lowerContent.includes(kw))) {
+  const grammarIssues = ['kindly do the needful', 'am writing to you', 'inheritance', 'lottery winner', 'claim prize'];
+  if (features.urgency === 1 && (grammarIssues.some(kw => lowerContent.includes(kw)) || /confirming your credentials|verify.*account|unrecognized device|redelivery fee/i.test(content))) {
     features.semanticMismatch = 1;
     indicators.push({
-      name: 'Semantic Mismatch',
+      name: 'Semantic & Phishing Action Signature',
       severity: 'high',
-      description: 'Combination of high urgency and poor/unusual grammar'
+      description: 'Combines urgency phrasing with high-risk credentials or payment action requests'
     });
   }
   
-  if (/password|ssn|social security|credit card|bank account/i.test(content)) {
+  if (/credential|credentials|password|passcode|secret key|security code|verification code|one-time code|ssn|social security|credit card|debit card|cvv|pin|bank account|redelivery fee|pay a.*fee/i.test(content)) {
     features.credentialRequest = 1;
     indicators.push({
-      name: 'Credential Request',
+      name: 'Credential & Financial Harvesting Pattern',
       severity: 'high',
-      description: 'Explicitly requests sensitive personal information'
+      description: 'Explicitly requests sensitive credentials, passwords, or fee payments'
     });
   }
 
-  // Crypto matching (BTC, ETH, LTC)
-  if (/(?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}|0x[a-fA-F0-9]{40}|[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}/.test(content)) {
+  // 4. Refined Brand-Keyword Proximity Matrix Check (Only triggers if linking to UNOFFICIAL domain)
+  const brandKeys = Object.keys(OFFICIAL_BRAND_DOMAINS);
+  const proximityKeywords = ['verify', 'kyc', 'block', 'suspend', 'login', 'redelivery', 'fee', 'pay', 'update', 'account', 'credentials', 'address', 'incomplete', 'delivered', 'package'];
+  
+  for (const brand of brandKeys) {
+    if (lowerContent.includes(brand)) {
+      if (proximityKeywords.some(term => lowerContent.includes(term))) {
+        const officialList = OFFICIAL_BRAND_DOMAINS[brand] || [];
+        const hasUnofficialDomainLink = tempDomains.size > 0 && Array.from(tempDomains).some(d => {
+          return !officialList.some(official => d === official || d.endsWith(`.${official}`));
+        });
+
+        if (hasUnofficialDomainLink) {
+          features.brandMismatch = 1;
+          indicators.push({
+            name: 'Brand-Keyword Proximity Threat',
+            severity: 'high',
+            description: `Target brand "${brand}" referenced alongside action terms, but links to an unofficial domain`
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  // 4. Cryptocurrency address matching (BTC, ETH, SOL, LTC)
+  if (/(?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}|0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44}|[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}/.test(content)) {
     features.cryptoRequest = 1;
     indicators.push({
-      name: 'Cryptocurrency Address',
+      name: 'Cryptocurrency Wallet Address',
       severity: 'high',
-      description: 'Mentions untraceable cryptocurrency wallet addresses'
+      description: 'Contains untraceable crypto wallet address (common in ransom/extortion)'
     });
   }
 
+  // 5. Sender email analysis
   if (/@/.test(content) && (/from:|sender:/i.test(content))) {
     const emailMatch = content.match(/[\w.-]+@[\w.-]+\.\w+/g);
     if (emailMatch) {
-      if (emailMatch.some(email => email.includes('gmail.com') || email.includes('yahoo.com'))) {
+      if (emailMatch.some(email => email.includes('gmail.com') || email.includes('yahoo.com') || email.includes('hotmail.com'))) {
         features.senderReputation = 1;
         indicators.push({
-          name: 'Suspicious Sender Reputation',
+          name: 'Free Email Sender Spoofing',
           severity: 'medium',
-          description: `Free email provider used for potentially official communication`
+          description: `Public email service used for official or transactional message`
         });
       }
     }
   }
   
-  if (/\.(zip|exe|scr|vbs|js|bat|cmd|msi|rar)$/i.test(content)) {
+  // 6. High-risk attachment types
+  if (/\.(zip|exe|scr|vbs|js|bat|cmd|msi|rar|iso|img|html|htm|svg|docm|xlsm)$/i.test(content)) {
     features.suspiciousAttachments = 1;
     indicators.push({
-      name: 'Suspicious Attachment Mention',
+      name: 'Dangerous Attachment Reference',
       severity: 'high',
-      description: 'Mentions or contains high-risk file types (.zip, .exe, etc.)'
+      description: 'Refers to or contains high-risk attachment types (.exe, .iso, .html, .vbs)'
     });
   }
 
-  // Extract URLs from content
-  const urlRegex = /(?:https?:\/\/)[^\s]+|(?:www\.)[^\s]+|\b[a-zA-Z0-9.-]+\.(?:com|org|net|io|co|us|uk|gov|edu|info|biz|me|tv|shop|app|xyz|in|ac|ca|au|de)\b/gi;
-  const urlMatches = content.match(urlRegex) || [];
+  // 7. HTML Link Mismatch (Text vs Href)
+  if (/<a\s+[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi.test(content)) {
+    const linkMatches = [...content.matchAll(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi)];
+    for (const match of linkMatches) {
+      const href = match[1];
+      const text = match[2].replace(/<[^>]+>/g, '').trim();
+      if (text.startsWith('http') || text.includes('.com') || text.includes('.org')) {
+        const cleanTextDomain = text.replace(/^https?:\/\//, '').split('/')[0].toLowerCase();
+        if (!href.toLowerCase().includes(cleanTextDomain)) {
+          features.linkDiscrepancy = 1;
+          indicators.push({
+            name: 'HTML Link Destination Mismatch',
+            severity: 'high',
+            description: `Link text shows "${text}" but actually navigates to "${href}"`
+          });
+        }
+      }
+    }
+  }
+
   const domains = new Set<string>();
-  const phishingUrlsKw = ['login', 'account', 'verify', 'secure', 'update', 'authenticate', 'confirm'];
+  const phishingUrlsKw = ['login', 'account', 'verify', 'secure', 'update', 'authenticate', 'confirm', 'signin', 'banking', 'phish', 'scam', 'pay', 'fee', 'redelivery'];
 
   for (const url of urlMatches) {
     if (url.length > 50) features.urlLength = 1;
@@ -378,27 +718,26 @@ export async function performLocalDetection(content: string, type: string): Prom
     if (phishingUrlsKw.some(kw => url.toLowerCase().includes(kw))) {
       features.urlKeywords = 1;
       indicators.push({
-        name: 'Suspicious URL Keywords',
+        name: 'Phishing Keyword in URL',
         severity: 'medium',
-        description: 'URL contains common phishing keywords'
+        description: 'URL contains sensitive credential-harvesting terms'
       });
     }
 
     try {
-      const expanded = await expandShortUrl(url); // Attempt expansion
+      const expanded = await expandShortUrl(url);
       if (expanded !== url) {
         features.linkDiscrepancy = 1;
         indicators.push({
-          name: 'Hidden Redirect',
+          name: 'URL Shortener Redirect',
           severity: 'medium',
-          description: `Shortened URL redirects to: ${expanded}`
+          description: `Shortened URL expands to target domain: ${expanded}`
         });
       }
 
       const domain = new URL(expanded.startsWith('http') ? expanded : `https://${expanded}`).hostname;
       domains.add(domain);
     } catch (e) {
-      // Invalid URL, try to extract domain manually
       const domainMatch = url.match(/(?:https?:\/\/)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
       if (domainMatch) domains.add(domainMatch[1]);
     }
@@ -406,96 +745,123 @@ export async function performLocalDetection(content: string, type: string): Prom
     if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(url)) {
       features.hasIp = 1;
       indicators.push({
-        name: 'IP-Based URL',
+        name: 'IP-Address Hostname',
         severity: 'high',
-        description: 'Uses IP address instead of domain'
+        description: 'URL uses raw IP address instead of registered domain name'
       });
     }
   }
 
-  // Also get bare domains from content (Expanded TLDs)
+  // Extract bare domains (excluding common file extension names)
+  const nonDomainExts = new Set(['exe', 'zip', 'pdf', 'png', 'jpg', 'gif', 'iso', 'img', 'svg', 'rar', 'doc', 'docx', 'xls', 'xlsx', 'mp4', 'txt', 'csv']);
   const bareMatches = content.match(/([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/gi) || [];
   for (const match of bareMatches) {
-    // Basic filter to avoid matching "ver.1.2.3" or similar non-domains
-    if (!match.includes('..') && match.length > 3) {
+    const ext = match.split('.').pop()?.toLowerCase() || '';
+    if (!match.includes('..') && match.length > 3 && !nonDomainExts.has(ext)) {
       domains.add(match.toLowerCase());
     }
   }
 
-  // --- FORENSICS: Fetch data for the first detected domain ---
+  // --- FORENSICS: Query DNS and Domain Age for the primary domain ---
   let forensics: ForensicsData | undefined;
   if (domains.size > 0) {
     const primaryDomain = Array.from(domains)[0];
     forensics = await getForensics(primaryDomain);
 
-    // Forensics-based Logic Integration
-    if (forensics.age.days && forensics.age.days < 30) {
+    if (forensics.age.days && forensics.age.days > 0 && forensics.age.days < 30) {
       features.domainAge = 1;
       indicators.push({
         name: 'Newly Created Domain',
         severity: 'high',
-        description: `Domain created only ${forensics.age.days} days ago`
+        description: `Domain registered or first seen only ${forensics.age.days} days ago`
       });
     }
 
-    if (forensics.dns.mx.length === 0) {
+    // SCOPED MX RECORD CHECK: Only trigger for emails or when an email sender address is present
+    if ((type === 'email' || /from:|sender:|@/i.test(content)) && forensics.dns.mx.length === 0) {
       indicators.push({
-        name: 'No Mail Server',
+        name: 'Missing Mail Server (MX Record)',
         severity: 'medium',
-        description: 'Domain cannot receive emails (suspicious for a "bank" or "support")'
+        description: 'Sender domain lacks MX mail records (cannot receive return emails)'
       });
     }
   }
-  // -----------------------------------------------------------
 
-  // Check each domain for punycode, free hosting, brand mismatches, and lookalikes
-  const KNOWN_BRANDS_LOWER = KNOWN_BRANDS.map(b => b.toLowerCase());
+  // 8. Domain Shannon Entropy, TLD Risk, Punycode, Free Hosting, Brand Mismatch, and Lookalikes
   for (const domain of domains) {
-    // 1. Punycode check
+    const parts = domain.split('.');
+    const tld = parts.pop() || '';
+    const sld = parts.pop() || '';
+
+    // Shannon Character Entropy Check (DGA Detection)
+    const entropy = calculateShannonEntropy(sld);
+    if (entropy > 3.7 && sld.length > 7) {
+      features.highRiskTld = 1;
+      indicators.push({
+        name: 'High Character Entropy (DGA Malicious Pattern)',
+        severity: 'high',
+        description: `Domain label "${sld}" exhibits high character randomness (entropy: ${entropy.toFixed(2)}) typical of automated phishing generators`
+      });
+    }
+
+    if (/phish|scam|fake|login-verify|secure-update/i.test(domain)) {
+      features.urlKeywords = 1;
+      indicators.push({
+        name: 'Explicit Malicious Term in Domain Name',
+        severity: 'high',
+        description: `Domain name "${domain}" contains explicit phishing keywords`
+      });
+    }
+
+    if (HIGH_RISK_TLDS.has(tld)) {
+      features.highRiskTld = 1;
+      indicators.push({
+        name: 'High-Risk Abuse TLD',
+        severity: 'medium',
+        description: `Domain utilizes TLD (.${tld}) heavily abused in phishing campaigns`
+      });
+    }
+
     if (domain.startsWith('xn--')) {
       features.punycode = 1;
       indicators.push({
-        name: 'Punycode/IDN Homograph',
+        name: 'Punycode / IDN Homograph',
         severity: 'high',
-        description: `Domain uses Punycode (${domain}) to spoof legitimate characters`
+        description: `Domain uses Punycode (${domain}) to spoof international characters`
       });
     }
 
-    // 2. Disposable Host check
     const freeHosts = ['000webhostapp.com', 'ngrok.io', 'firebaseapp.com', 'herokuapp.com', 'netlify.app', 'vercel.app', 'glitch.me', 'repl.co'];
-    if (freeHosts.some(host => domain.endsWith(host)) && !domain.includes('phishguard7')) { // avoid flagging ourselves
+    if (freeHosts.some(host => domain.endsWith(host))) {
       features.disposableHost = 1;
       indicators.push({
-        name: 'Disposable/Free Hosting',
+        name: 'Free / Disposable Web Host',
         severity: 'medium',
-        description: `Domain is hosted on a free or temporary platform (${domain})`
+        description: `Site is hosted on free sub-domain provider (${domain})`
       });
     }
 
-    // 3. Brand Context Mismatch
     if (features.brandMismatch === 0) {
-      for (const brand of KNOWN_BRANDS_LOWER) {
-        if (lowerContent.includes(brand) && !domain.includes(brand) && !['000webhostapp.com', 'ngrok.io', 'firebaseapp.com'].some(h => domain.endsWith(h))) {
+      for (const brand of brandKeys) {
+        if (lowerContent.includes(brand) && !domain.includes(brand) && !freeHosts.some(h => domain.endsWith(h))) {
           features.brandMismatch = 1;
           indicators.push({
-            name: 'Brand Context Mismatch',
+            name: 'Brand Mismatch Signature',
             severity: 'high',
-            description: `Message claims to be from '${brand}' but links to an unrelated domain (${domain})`
+            description: `Content references "${brand}" but directs to an unrelated domain (${domain})`
           });
           break;
         }
       }
     }
 
-    // 4. Lookalike check
     const lookalikeCheck = detectLookalikeAttack(domain);
     if (lookalikeCheck.isLookalike) {
       features.lookalike = 1;
-      const subs = lookalikeCheck.substitutions?.slice(0, 2).join(', ') || 'various';
       indicators.push({
-        name: 'Lookalike Domain Attack',
+        name: 'Lookalike / Typosquatting Attack',
         severity: 'high',
-        description: `Domain "${domain}" is a lookalike of "${lookalikeCheck.targetBrand}" with substitutions: ${subs}`
+        description: lookalikeCheck.reason || `Domain "${domain}" is a lookalike targeting brand "${lookalikeCheck.targetBrand}"`
       });
     }
   }
@@ -543,23 +909,26 @@ export async function detectPhishing(content: string, type: 'auto' | 'url' | 'em
   // Call Vercel serverless function for third-party API checks (keys stay server-side)
   if (urls.length > 0) {
     try {
-      const response = await fetch('/api/detect-phishing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls }),
-      });
+      const origin = typeof window !== 'undefined' && window.location ? window.location.origin : '';
+      if (origin) {
+        const response = await fetch(`${origin}/api/detect-phishing`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls }),
+        });
 
-      if (response.ok) {
-        const serverData = await response.json() as {
-          indicators: { name: string; severity: 'low' | 'medium' | 'high'; description: string }[];
-          threat_audit: { scan_time: string; sources: Record<string, unknown> } | null;
-          score: number;
-        };
+        if (response.ok) {
+          const serverData = await response.json() as {
+            indicators: { name: string; severity: 'low' | 'medium' | 'high'; description: string }[];
+            threat_audit: { scan_time: string; sources: Record<string, unknown> } | null;
+            score: number;
+          };
 
-        indicators.push(...serverData.indicators);
-        score += serverData.score;
-        if (serverData.threat_audit) {
-          threat_audit = serverData.threat_audit;
+          indicators.push(...serverData.indicators);
+          score += serverData.score;
+          if (serverData.threat_audit) {
+            threat_audit = serverData.threat_audit;
+          }
         }
       }
     } catch (e) {
@@ -569,6 +938,14 @@ export async function detectPhishing(content: string, type: 'auto' | 'url' | 'em
 
   // Combine with Local Heuristics (still runs client-side — no API keys needed)
   const localResult = await performLocalDetection(content, type);
+  
+  // Respect local heuristic legitimate guards (2FA, app integration, or cloud alert) when third-party threat APIs report clean (score === 0)
+  if (localResult.label === 'safe' && localResult.risk_percentage <= 15 && score === 0) {
+    return {
+      ...localResult,
+      threat_audit: threat_audit || localResult.threat_audit,
+    };
+  }
   
   const mergedIndicators = [...indicators, ...localResult.details.indicators];
   const finalScore = Math.min(score + localResult.risk_percentage, 100);

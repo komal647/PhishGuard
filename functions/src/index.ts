@@ -41,12 +41,12 @@ interface ThreatAuditSources {
 
 function getApiKeys() {
   return {
-    VIRUSTOTAL_KEY: process.env.VIRUSTOTAL_KEY || "",
-    GOOGLE_SAFE_BROWSING_KEY: process.env.GOOGLE_SAFE_BROWSING_KEY || "",
-    PHISHTANK_KEY: process.env.PHISHTANK_KEY || "",
-    IPQUALITYSCORE_KEY: process.env.IPQUALITYSCORE_KEY || "",
-    CLOUDMERSIVE_KEY: process.env.CLOUDMERSIVE_KEY || "",
-    URLHAUS_KEY: process.env.URLHAUS_KEY || "",
+    VIRUSTOTAL_KEY: process.env.VIRUSTOTAL_KEY || process.env.VITE_VIRUSTOTAL_KEY || "",
+    GOOGLE_SAFE_BROWSING_KEY: process.env.GOOGLE_SAFE_BROWSING_KEY || process.env.VITE_GOOGLE_SAFE_BROWSING_KEY || "",
+    PHISHTANK_KEY: process.env.PHISHTANK_KEY || process.env.VITE_PHISHTANK_KEY || "",
+    IPQUALITYSCORE_KEY: process.env.IPQUALITYSCORE_KEY || process.env.VITE_IPQUALITYSCORE_KEY || "",
+    CLOUDMERSIVE_KEY: process.env.CLOUDMERSIVE_KEY || process.env.VITE_CLOUDMERSIVE_KEY || "",
+    URLHAUS_KEY: process.env.URLHAUS_KEY || process.env.VITE_URLHAUS_KEY || "",
   };
 }
 

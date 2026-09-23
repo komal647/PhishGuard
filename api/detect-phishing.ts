@@ -17,13 +17,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.json({ indicators: [], threat_audit: null, score: 0 });
   }
 
-  // Read API keys from Vercel environment variables (never sent to browser)
-  const VIRUSTOTAL_KEY = process.env.VIRUSTOTAL_KEY || '';
-  const GOOGLE_SAFE_BROWSING_KEY = process.env.GOOGLE_SAFE_BROWSING_KEY || '';
-  const PHISHTANK_KEY = process.env.PHISHTANK_KEY || '';
-  const IPQUALITYSCORE_KEY = process.env.IPQUALITYSCORE_KEY || '';
-  const CLOUDMERSIVE_KEY = process.env.CLOUDMERSIVE_KEY || '';
-  const URLHAUS_KEY = process.env.URLHAUS_KEY || '';
+  // Support both standard variables and Vite-prefixed ones that the user might have provided
+  const VIRUSTOTAL_KEY = process.env.VIRUSTOTAL_KEY || process.env.VITE_VIRUSTOTAL_KEY || '';
+  const GOOGLE_SAFE_BROWSING_KEY = process.env.GOOGLE_SAFE_BROWSING_KEY || process.env.VITE_GOOGLE_SAFE_BROWSING_KEY || '';
+  const PHISHTANK_KEY = process.env.PHISHTANK_KEY || process.env.VITE_PHISHTANK_KEY || '';
+  const IPQUALITYSCORE_KEY = process.env.IPQUALITYSCORE_KEY || process.env.VITE_IPQUALITYSCORE_KEY || '';
+  const CLOUDMERSIVE_KEY = process.env.CLOUDMERSIVE_KEY || process.env.VITE_CLOUDMERSIVE_KEY || '';
+  const URLHAUS_KEY = process.env.URLHAUS_KEY || process.env.VITE_URLHAUS_KEY || '';
 
   const indicators: ThreatIndicator[] = [];
   let score = 0;
@@ -54,6 +54,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             if (stats.malicious > 0) {
               indicators.push({ name: 'VirusTotal Flag', severity: 'high', description: `Flagged malicious by ${stats.malicious} security vendors on VT` });
               score += 60;
+            } else if (stats.suspicious > 0) {
+              indicators.push({ name: 'VirusTotal Suspicious', severity: 'medium', description: `Flagged suspicious by ${stats.suspicious} security vendors on VT` });
+              score += 30;
             }
           }
         }
@@ -141,22 +144,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       } catch (e: any) { console.warn('Cloudmersive Error:', e.message); }
     }
 
-    // 6. URLhaus
-    if (URLHAUS_KEY) {
-      try {
-        const r = await fetch('https://urlhaus-api.abuse.ch/v1/url/', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ url: cleanUrl }).toString(),
-        });
-        if (r.ok) {
-          const data = await r.json() as any;
-          if (data?.query_status === 'ok') {
-            indicators.push({ name: 'URLhaus', severity: 'high', description: 'URL is tracked as malware distribution site by URLhaus.' });
-            score += 80;
-          }
+    // 6. URLhaus (Keyless Public API by abuse.ch)
+    try {
+      const bodyParams = new URLSearchParams({ url: cleanUrl }).toString();
+      const r = await fetch('https://urlhaus-api.abuse.ch/v1/url/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: bodyParams,
+      });
+      if (r.ok) {
+        const data = await r.json() as any;
+        if (data?.query_status === 'ok' && data?.url_status === 'online') {
+          threat_audit.sources.urlhaus = { scanned: true, status: data.url_status, threat: data.threat };
+          indicators.push({
+            name: 'URLhaus Malware Flag',
+            severity: 'high',
+            description: `URL is actively tracked as ${data.threat || 'malware/phishing'} by URLhaus`
+          });
+          score += 85;
+        } else if (data?.query_status === 'ok') {
+          threat_audit.sources.urlhaus = { scanned: true, status: data.url_status, threat: data.threat };
+          indicators.push({
+            name: 'URLhaus Historical Flag',
+            severity: 'medium',
+            description: `URL has history in URLhaus threat database (${data.threat || 'malware'})`
+          });
+          score += 45;
+        } else {
+          threat_audit.sources.urlhaus = { scanned: true, found: false };
         }
-      } catch (e: any) { console.warn('URLhaus Error:', e.message); }
+      }
+    } catch (e: any) {
+      console.warn('URLhaus Error:', e.message);
     }
   }
 
